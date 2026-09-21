@@ -1,11 +1,19 @@
-﻿import os, sys, time, re
+﻿import os
+import sys
+import time
+import re
 from datetime import datetime
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 import config
 
+# -----------------------------------------------
+# Logging
+# -----------------------------------------------
 def log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     formatted_msg = f"[{timestamp}] {message}"
@@ -22,12 +30,27 @@ def normalize_link(link_str):
         return ""
     return str(link_str).strip().rstrip("/").lower()
 
-def fetch_leetcode_submissions(existing_links, existing_titles):
+def create_http_session():
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*"
+    })
+    return session
+
+# -----------------------------------------------
+# 1. LEETCODE FETCHER
+# -----------------------------------------------
+def fetch_leetcode_submissions(existing_links, existing_titles, session):
     username = getattr(config, "LEETCODE_USERNAME", None)
     if not username:
         return []
     url = config.LEETCODE_GRAPHQL_URL
-    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+    
     query_recent = """
     query getRecentAcSubmissions($username: String!, $limit: Int!) {
       recentAcSubmissionList(username: $username, limit: $limit) {
@@ -44,7 +67,7 @@ def fetch_leetcode_submissions(existing_links, existing_titles):
     """
     results = []
     try:
-        r = requests.post(url, json={"query": query_recent, "variables": {"username": username, "limit": 25}}, headers=headers, timeout=10)
+        r = session.post(url, json={"query": query_recent, "variables": {"username": username, "limit": 25}}, timeout=12)
         r.raise_for_status()
         subs = r.json().get("data", {}).get("recentAcSubmissionList", []) or []
         
@@ -58,16 +81,17 @@ def fetch_leetcode_submissions(existing_links, existing_titles):
             link = f"https://leetcode.com/problems/{slug}/"
             full_title = f"{raw_title} - LeetCode"
             
+            # Fast pre-filter: skip detail API call if already present in sheet
             if normalize_link(link) in existing_links or full_title.strip().lower() in existing_titles:
                 continue
 
             diff, topics = "Medium", "General"
             try:
-                p_r = requests.post(url, json={"query": query_problem, "variables": {"titleSlug": slug}}, headers=headers, timeout=5)
+                p_r = session.post(url, json={"query": query_problem, "variables": {"titleSlug": slug}}, timeout=8)
                 q = p_r.json().get("data", {}).get("question", {})
                 if q:
                     diff = q.get("difficulty", "Medium")
-                    tags = [t["name"] for t in q.get("topicTags", []) if "name" in t]
+                    tags = [t["name"].replace("\u2013", "-").replace("\u2014", "-") for t in q.get("topicTags", []) if "name" in t]
                     if tags:
                         topics = ", ".join(tags)
             except Exception as e:
@@ -87,13 +111,16 @@ def fetch_leetcode_submissions(existing_links, existing_titles):
         log(f"Error fetching LeetCode submissions: {e}")
     return results
 
-def fetch_codeforces_submissions(existing_links, existing_titles):
+# -----------------------------------------------
+# 2. CODEFORCES FETCHER
+# -----------------------------------------------
+def fetch_codeforces_submissions(existing_links, existing_titles, session):
     handle = getattr(config, "CODEFORCES_HANDLE", None)
     if not handle:
         return []
     results = []
     try:
-        r = requests.get(f"https://codeforces.com/api/user.status?handle={handle}&from=1&count=50", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = session.get(f"https://codeforces.com/api/user.status?handle={handle}&from=1&count=50", timeout=12)
         r.raise_for_status()
         data = r.json()
         if data.get("status") == "OK":
@@ -137,13 +164,16 @@ def fetch_codeforces_submissions(existing_links, existing_titles):
         log(f"Error fetching Codeforces submissions: {e}")
     return results
 
-def fetch_atcoder_submissions(existing_links, existing_titles):
+# -----------------------------------------------
+# 3. ATCODER FETCHER
+# -----------------------------------------------
+def fetch_atcoder_submissions(existing_links, existing_titles, session):
     handle = getattr(config, "ATCODER_HANDLE", None)
     if not handle:
         return []
     results = []
     try:
-        r = requests.get(f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={handle}&from_second=0", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = session.get(f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={handle}&from_second=0", timeout=12)
         r.raise_for_status()
         seen = set()
         for sub in r.json():
@@ -180,9 +210,15 @@ def fetch_atcoder_submissions(existing_links, existing_titles):
         log(f"Error fetching AtCoder submissions: {e}")
     return results
 
-def fetch_gfg_submissions(existing_links, existing_titles):
+# -----------------------------------------------
+# 4. GFG FETCHER (placeholder)
+# -----------------------------------------------
+def fetch_gfg_submissions(existing_links, existing_titles, session):
     return []
 
+# -----------------------------------------------
+# EXCEL UNMERGE HELPER
+# -----------------------------------------------
 def unmerge_empty_ranges(sheet):
     to_unmerge = []
     for rng in list(sheet.merged_cells.ranges):
@@ -194,6 +230,9 @@ def unmerge_empty_ranges(sheet):
         except Exception:
             pass
 
+# -----------------------------------------------
+# MAIN PIPELINE
+# -----------------------------------------------
 def update_excel_tracker():
     lock_file = os.path.join(os.path.dirname(config.LOG_FILE), "tracker.lock")
     if os.path.exists(lock_file):
@@ -243,7 +282,7 @@ def _run():
 
     sheet = workbook[config.SHEET_NAME]
 
-    # Clean up any merged ranges in data area
+    # Clean up empty merged ranges
     unmerge_empty_ranges(sheet)
 
     existing_links = set()
@@ -264,25 +303,26 @@ def _run():
 
     log(f"Pre-scan complete: {len(existing_links)} existing links found. Last data row: {last_data_row}")
 
+    session = create_http_session()
     all_submissions = []
     
     log("Fetching LeetCode submissions...")
-    lc = fetch_leetcode_submissions(existing_links, existing_titles)
+    lc = fetch_leetcode_submissions(existing_links, existing_titles, session)
     log(f"-> LeetCode: {len(lc)} NEW submission(s) to add.")
     all_submissions.extend(lc)
 
     log("Fetching Codeforces submissions...")
-    cf = fetch_codeforces_submissions(existing_links, existing_titles)
+    cf = fetch_codeforces_submissions(existing_links, existing_titles, session)
     log(f"-> Codeforces: {len(cf)} NEW submission(s) to add.")
     all_submissions.extend(cf)
 
     log("Fetching AtCoder submissions...")
-    at = fetch_atcoder_submissions(existing_links, existing_titles)
+    at = fetch_atcoder_submissions(existing_links, existing_titles, session)
     log(f"-> AtCoder: {len(at)} NEW submission(s) to add.")
     all_submissions.extend(at)
 
     log("Fetching GeeksforGeeks submissions...")
-    gfg = fetch_gfg_submissions(existing_links, existing_titles)
+    gfg = fetch_gfg_submissions(existing_links, existing_titles, session)
     log(f"-> GeeksforGeeks: {len(gfg)} NEW submission(s) to add.")
     all_submissions.extend(gfg)
 
